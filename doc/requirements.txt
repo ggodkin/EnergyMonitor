@@ -1,0 +1,30 @@
+Energy Monitor
+### Summary of Requirements
+
+- **Microcontroller**:
+  - **AVR128DB28**: Handles precise analog measurements (12-bit ADC, 10 channels, internal voltage reference, 3 OpAmps).
+  - **ESP32**: Manages Wi-Fi, MQTT, OTA, and Home Automation (e.g., Home Assistant).
+
+- **Sensors**:
+  - **ZMPT101B**: 1 channel for AC voltage (biased at ~1.65V).
+  - **SCT013 variants**: Support for **15A/1V, 50A/1V, 100A/1V** — up to **9 CTs** total.
+  - All use built-in burden resistors; no external burden needed. 
+
+- **Signal Conditioning**:
+  - Use **on-chip OpAmps** (AVR128DB28) to bias and condition signals.
+  - Add **filtering capacitors (e.g., 10μF)** for noise reduction.
+
+- **Firmware**:
+  - **AVR128DB28**: Run **EmonLibCM (avrdb branch)** for accurate RMS, power, and energy with per-sensor calibration.
+  - **ESP32**: Communicate via **UART, I2C, or SPI**; publish data over **MQTT**. 
+
+- **OLED Display (128x64 SSD1306)**:
+  - Connect to **ESP32 via I2C** (SDA: GPIO21, SCL: GPIO22) or use SPI.
+  - Display real-time stats (V, I, P, kWh) for **first two sensors** (ZMPT101B + one SCT013).
+  - Display number of attached current sensors
+  - Use **Adafruit_SSD1306** and **Adafruit_GFX** libraries. 
+
+- **Calibration**:
+  - Calibrate each CT using its rated current (15, 50, or 100) in software.
+  - Adjust voltage offset and sensitivity based on known mains value.
+  - Maximize sampling rate based on number of attached current sensors
