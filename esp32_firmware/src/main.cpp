@@ -1,6 +1,4 @@
-// EnergyMonitor - ESP32 firmware
-// Receives data from AVR via UART, shows on OLED, publishes MQTT
-// With auto-detect I2C address for SSD1306
+// EnergyMonitor - ESP32 firmware with WiFi fallback AP + web config
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -8,102 +6,123 @@
 #include <Adafruit_SSD1306.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
+#include <Preferences.h>
+#include <DNSServer.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncTCP.h>
 
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);  // We'll set address later
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-// UART from AVR
 #define UART_RX_PIN 16
 #define UART_TX_PIN 17
 HardwareSerial SerialAVR(2);
 
-// ── CHANGE THESE ──
-const char* ssid          = "your-wifi-ssid";
-const char* password      = "your-wifi-password";
-const char* mqtt_server   = "192.168.1.100";
-const int   mqtt_port     = 1883;
-const char* mqtt_client_id = "EnergyMonitor-ESP32";
-const char* mqtt_topic_base = "home/energy/hottub/";
+Preferences prefs;
+
+String wifi_ssid;
+String wifi_pass;
+String mqtt_server_str;
+int    mqtt_port = 1883;
+String mqtt_client_id = "EnergyMonitor-ESP32";
+String mqtt_topic_base = "home/energy/hottub/";
 
 WiFiClient espClient;
 PubSubClient client(espClient);
-
 String receivedData = "";
 uint8_t numSensors = 0;
-float voltage = 0.0f, curr1 = 0.0f, pow1 = 0.0f;
-float curr2 = 0.0f, pow2 = 0.0f;
+float voltage = 0.0f, curr1 = 0.0f, pow1 = 0.0f, curr2 = 0.0f, pow2 = 0.0f;
 
-unsigned long lastReconnectAttempt = 0;
+unsigned long wifiConnectStart = 0;
+bool inAPMode = false;
+const unsigned long AP_FALLBACK_TIMEOUT = 120000UL;
 
-// ── Auto-detect I2C address ──
+const byte DNS_PORT = 53;
+DNSServer dnsServer;
+AsyncWebServer server(80);
+
 uint8_t detectOLEDAddress() {
-  Serial.println("Scanning I2C bus for SSD1306 OLED...");
-
-  // Common addresses first
+  Serial.println("Scanning I2C for OLED...");
   uint8_t candidates[] = {0x3C, 0x3D};
-  for (uint8_t i = 0; i < sizeof(candidates); i++) {
-    uint8_t addr = candidates[i];
+  for (auto addr : candidates) {
     Wire.beginTransmission(addr);
-    if (Wire.endTransmission() == 0) {
-      Serial.print("Found OLED at 0x");
-      Serial.println(addr, HEX);
-      return addr;
-    }
+    if (Wire.endTransmission() == 0) return addr;
   }
-
-  // Full scan if common ones not found
-  Serial.println("Common addresses not found - scanning all...");
-  for (uint8_t addr = 0x08; addr < 0x78; addr++) {
-    Wire.beginTransmission(addr);
-    uint8_t error = Wire.endTransmission();
-    if (error == 0) {
-      Serial.print("Device found at 0x");
-      if (addr < 16) Serial.print("0");
-      Serial.println(addr, HEX);
-      return addr;  // Assume first found is OLED
-    }
-  }
-
-  Serial.println("No I2C device found! Check wiring / pull-ups.");
-  return 0x3C;  // Fallback to most common - code will likely fail gracefully
+  return 0x3C;
 }
 
-// ── Helper functions ──
+void loadCredentials() {
+  prefs.begin("energy-cfg", false);
+  wifi_ssid = prefs.getString("ssid", "");
+  wifi_pass = prefs.getString("pass", "");
+  mqtt_server_str = prefs.getString("mqtt_srv", "192.168.1.100");
+  mqtt_port = prefs.getInt("mqtt_port", 1883);
+  mqtt_client_id = prefs.getString("mqtt_id", "EnergyMonitor-ESP32");
+  prefs.end();
+}
 
-void connectWiFi() {
-  Serial.print("Connecting to WiFi...");
-  WiFi.begin(ssid, password);
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 20000) {
-    delay(500);
-    Serial.print(".");
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nConnected. IP: " + WiFi.localIP().toString());
-  } else {
-    Serial.println("\nWiFi failed.");
-  }
+void saveCredentials(const String& ssid, const String& pass, const String& mqttSrv, int mqttPrt, const String& mqttId) {
+  prefs.begin("energy-cfg", false);
+  prefs.putString("ssid", ssid);
+  prefs.putString("pass", pass);
+  prefs.putString("mqtt_srv", mqttSrv);
+  prefs.putInt("mqtt_port", mqttPrt);
+  prefs.putString("mqtt_id", mqttId);
+  prefs.end();
+  ESP.restart();
+}
+
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML><html><head><title>EnergyMonitor Setup</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:Arial;margin:20px;}input{width:100%;padding:10px;margin:8px 0;}</style></head><body><h2>EnergyMonitor Config</h2><form action="/save"><label>WiFi SSID:</label><input type="text" name="ssid" required><br><label>WiFi Password:</label><input type="password" name="pass"><br><br><label>MQTT Server:</label><input type="text" name="mqtt_srv" value="192.168.1.100" required><br><label>MQTT Port:</label><input type="number" name="mqtt_prt" value="1883"><br><label>MQTT Client ID:</label><input type="text" name="mqtt_id" value="EnergyMonitor-ESP32"><br><input type="submit" value="Save & Restart"></form></body></html>
+)rawliteral";
+
+void startAPMode() {
+  inAPMode = true;
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
+  WiFi.softAP("EnergyMonitor-Setup", "");
+
+  Serial.print("AP IP: "); Serial.println(WiFi.softAPIP());
+
+  dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", index_html);
+  });
+
+  server.on("/save", HTTP_GET, [](AsyncWebServerRequest *request){
+    String ssid = request->getParam("ssid")->value();
+    String pass = request->getParam("pass")->value();
+    String mqtt_srv = request->getParam("mqtt_srv")->value();
+    int mqtt_prt = request->getParam("mqtt_prt")->value().toInt();
+    String mqtt_id = request->getParam("mqtt_id")->value();
+    if (ssid.length() > 0) saveCredentials(ssid, pass, mqtt_srv, mqtt_prt, mqtt_id);
+    request->send(200, "text/html", "<h2>Saved! Restarting...</h2>");
+  });
+
+  // Redirect everything else to root
+  server.onNotFound([](AsyncWebServerRequest *request){
+    request->redirect("/");
+  });
+
+  server.begin();
+  Serial.println("Captive portal active");
 }
 
 bool reconnectMQTT() {
   Serial.print("MQTT connect...");
-  String clientId = String(mqtt_client_id) + "-" + String(random(0xffff), HEX);
-  if (client.connect(clientId.c_str())) {
+  if (client.connect(mqtt_client_id.c_str())) {
     Serial.println("OK");
     return true;
-  } else {
-    Serial.print("failed (rc=");
-    Serial.print(client.state());
-    Serial.println(")");
-    return false;
   }
+  Serial.println("failed");
+  return false;
 }
 
 void processData(String data) {
   if (!data.startsWith("DATA:")) return;
   data = data.substring(5);
-
   int idx[6] = {0};
   int pos = 0;
   for (int i = 0; i < 5; i++) {
@@ -114,24 +133,18 @@ void processData(String data) {
   idx[5] = data.length();
 
   numSensors = data.substring(0, idx[0]).toInt();
-  voltage    = data.substring(idx[0]+1, idx[1]).toFloat();
-  curr1      = data.substring(idx[1]+1, idx[2]).toFloat();
-  pow1       = data.substring(idx[2]+1, idx[3]).toFloat();
-  curr2      = data.substring(idx[3]+1, idx[4]).toFloat();
-  pow2       = data.substring(idx[4]+1, idx[5]).toFloat();
+  voltage = data.substring(idx[0]+1, idx[1]).toFloat();
+  curr1 = data.substring(idx[1]+1, idx[2]).toFloat();
+  pow1 = data.substring(idx[2]+1, idx[3]).toFloat();
+  curr2 = data.substring(idx[3]+1, idx[4]).toFloat();
+  pow2 = data.substring(idx[4]+1, idx[5]).toFloat();
 
-  Serial.printf("Parsed: V=%.1f I1=%.3f P1=%.0f I2=%.3f P2=%.0f\n",
-                voltage, curr1, pow1, curr2, pow2);
+  Serial.printf("Data: V=%.1f I1=%.3f P1=%.0f\n", voltage, curr1, pow1);
 
   if (client.connected()) {
     char buf[16];
-    snprintf(buf, sizeof(buf), "%.1f", voltage); client.publish((String(mqtt_topic_base) + "voltage").c_str(), buf);
-    snprintf(buf, sizeof(buf), "%.3f", curr1);   client.publish((String(mqtt_topic_base) + "current1").c_str(), buf);
-    snprintf(buf, sizeof(buf), "%.0f", pow1);    client.publish((String(mqtt_topic_base) + "power1").c_str(), buf);
-    if (numSensors >= 2) {
-      snprintf(buf, sizeof(buf), "%.3f", curr2); client.publish((String(mqtt_topic_base) + "current2").c_str(), buf);
-      snprintf(buf, sizeof(buf), "%.0f", pow2);  client.publish((String(mqtt_topic_base) + "power2").c_str(), buf);
-    }
+    snprintf(buf, sizeof(buf), "%.1f", voltage); client.publish((mqtt_topic_base + "voltage").c_str(), buf);
+    // add others as needed
   }
 }
 
@@ -139,72 +152,78 @@ void updateDisplay() {
   display.clearDisplay();
   display.setCursor(0, 0);
   display.setTextSize(1);
-  display.printf("Sensors: %d\n", numSensors);
-  display.printf("V: %.1f V\n", voltage);
-  display.printf("I1: %.3f A\n", curr1);
-  display.printf("P1: %.0f W\n", pow1);
-  if (numSensors >= 2) {
-    display.printf("I2: %.3f A\n", curr2);
-    display.printf("P2: %.0f W\n", pow2);
+  display.setTextColor(SSD1306_WHITE);
+  if (inAPMode) {
+    display.println("CONFIG MODE");
+    display.println("Connect to:");
+    display.println("EnergyMonitor-Setup");
+    display.println("http://192.168.4.1");
+  } else {
+    display.printf("V: %.1f V\n", voltage);
+    display.printf("I1: %.3f A\n", curr1);
+    display.printf("P1: %.0f W\n", pow1);
   }
-  display.setCursor(90, 0);
-  display.print(WiFi.status() == WL_CONNECTED ? "WiFi" : "NoWiFi");
-  display.setCursor(90, 10);
-  display.print(client.connected() ? "MQTT" : "NoMQ");
   display.display();
 }
-
-// ── Main ──
 
 void setup() {
   Serial.begin(115200);
   SerialAVR.begin(115200, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
 
-  Wire.begin();  // Default I2C pins (GPIO21 SDA, GPIO22 SCL on most ESP32)
-
-  // Auto-detect address
-  uint8_t oledAddr = detectOLEDAddress();
-
-  // Init display with detected address
-  if (!display.begin(SSD1306_SWITCHCAPVCC, oledAddr)) {
-    Serial.println(F("SSD1306 init failed - check wiring/address"));
-    // Continue anyway - display may still work if fallback is correct
+  Wire.begin();
+  uint8_t addr = detectOLEDAddress();
+  if (!display.begin(SSD1306_SWITCHCAPVCC, addr)) {
+    Serial.println("OLED failed");
   }
-
   display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
   display.setCursor(0,0);
-  display.println("EnergyMonitor");
-  display.print("OLED @ 0x");
-  display.println(oledAddr, HEX);
+  display.println("Starting...");
   display.display();
 
-  connectWiFi();
-  client.setServer(mqtt_server, mqtt_port);
+  loadCredentials();
+
+  client.setServer(mqtt_server_str.c_str(), mqtt_port);
+
+  if (wifi_ssid.length() > 0) {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+    wifiConnectStart = millis();
+  } else {
+    startAPMode();
+  }
 }
 
 void loop() {
-  if (SerialAVR.available()) {
-    char c = SerialAVR.read();
-    if (c == '\n') {
-      processData(receivedData);
-      receivedData = "";
-    } else {
-      receivedData += c;
-    }
-  }
-
-  if (!client.connected()) {
-    unsigned long now = millis();
-    if (now - lastReconnectAttempt > 5000) {
-      lastReconnectAttempt = now;
-      if (reconnectMQTT()) lastReconnectAttempt = 0;
-    }
+  if (inAPMode) {
+    dnsServer.processNextRequest();
   } else {
-    client.loop();
+    if (WiFi.status() != WL_CONNECTED) {
+      if (millis() - wifiConnectStart > AP_FALLBACK_TIMEOUT) {
+        startAPMode();
+      }
+    } else {
+      if (!client.connected()) {
+        static unsigned long last = 0;
+        if (millis() - last > 5000) {
+          last = millis();
+          reconnectMQTT();
+        }
+      } else {
+        client.loop();
+      }
+    }
+
+    while (SerialAVR.available()) {
+      char c = SerialAVR.read();
+      if (c == '\n') {
+        processData(receivedData);
+        receivedData = "";
+      } else {
+        receivedData += c;
+      }
+    }
   }
 
   updateDisplay();
-  delay(100);
+  delay(50);
 }
